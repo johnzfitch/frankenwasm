@@ -31,11 +31,14 @@ type (
 		cachePath     string
 		logger        *slog.Logger
 		hostFunctions []extism.HostFunction
+		numWorkers    int // parallel compilation workers (0 = sequential)
+		sharedRuntime bool
 
 		plugins       []pluginEntry
 		pluginMap     map[string]int // name -> index in plugins slice
 		runtimeConfig wazero.RuntimeConfig
 		runtimeCache  wazero.CompilationCache
+		sr            *extism.SharedRuntime
 		mu            sync.RWMutex
 		cacheInit     sync.Once
 	}
@@ -83,7 +86,13 @@ func (m *Manager) Load(ctx context.Context, name string, path string) error {
 		RuntimeConfig: m.runtimeConfig,
 	}
 
-	compiledPlugin, err := extism.NewCompiledPlugin(ctx, pluginManifest, pluginConfig, m.hostFunctions)
+	var compiledPlugin *extism.CompiledPlugin
+	var err error
+	if m.sr != nil {
+		compiledPlugin, err = extism.NewCompiledPluginWithRuntime(ctx, pluginManifest, pluginConfig, m.hostFunctions, m.sr)
+	} else {
+		compiledPlugin, err = extism.NewCompiledPlugin(ctx, pluginManifest, pluginConfig, m.hostFunctions)
+	}
 	if err != nil {
 		return fmt.Errorf("failed to compile plugin %s: %v", path, err)
 	}
@@ -110,6 +119,31 @@ func (m *Manager) Load(ctx context.Context, name string, path string) error {
 	)
 
 	return nil
+}
+
+// LoadAll loads multiple plugins concurrently using parallel compilation
+// workers. paths is a map of plugin name -> file path.
+func (m *Manager) LoadAll(ctx context.Context, paths map[string]string) error {
+	if err := m.initCache(); err != nil {
+		return fmt.Errorf("failed to initialize compilation cache: %v", err)
+	}
+
+	workers := m.numWorkers
+	if workers <= 0 {
+		workers = 1
+	}
+
+	g, ctx := errgroup.WithContext(ctx)
+	g.SetLimit(workers)
+
+	for name, path := range paths {
+		name, path := name, path
+		g.Go(func() error {
+			return m.Load(ctx, name, path)
+		})
+	}
+
+	return g.Wait()
 }
 
 // IsLoaded returns whether the manager has any plugins loaded.
@@ -157,7 +191,6 @@ func (m *Manager) InstantiateAll(ctx context.Context) (*Registry, error) {
 	for i, p := range m.plugins {
 		registry.plugins = append(registry.plugins, registryEntry{name: p.name, plugin: instances[i]})
 		registry.pluginMap[p.name] = i
-		registry.locks.Store(p.name, &sync.Mutex{})
 	}
 
 	return registry, nil
@@ -172,6 +205,12 @@ func (m *Manager) Close(ctx context.Context) error {
 	for _, p := range m.plugins {
 		if err := p.plugin.Close(ctx); err != nil {
 			errs = append(errs, fmt.Errorf("plugin %s: %w", p.name, err))
+		}
+	}
+
+	if m.sr != nil {
+		if err := m.sr.Close(ctx); err != nil {
+			errs = append(errs, fmt.Errorf("shared runtime: %w", err))
 		}
 	}
 
@@ -215,6 +254,18 @@ func (m *Manager) initCache() error {
 			}
 			m.runtimeCache = cache
 			m.runtimeConfig = m.runtimeConfig.WithCompilationCache(cache)
+		}
+
+		// Initialize shared runtime if enabled. Uses background context because
+		// sync.Once captures the closure — subsequent calls see the already-
+		// initialized result regardless of caller context.
+		if m.sharedRuntime {
+			sr, err := extism.NewSharedRuntime(context.Background(), m.runtimeConfig, true)
+			if err != nil {
+				initErr = err
+				return
+			}
+			m.sr = sr
 		}
 	})
 	return initErr

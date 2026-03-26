@@ -8,3 +8,6 @@ plugins/*.wasm
 env.yaml
 **/target/
 **/node_modules/
+
+# Vendored dependency sources (cloned locally, not committed)
+deps/

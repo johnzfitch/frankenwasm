@@ -2,7 +2,7 @@ package phpext
 
 // #include <stdlib.h>
 // #include <stdint.h>
-// #cgo CFLAGS: -I../../frankenphp
+// #cgo CFLAGS: -I../deps/frankenphp
 // #include "frankenphp.h"
 // #include "phpext.h"
 //
@@ -81,27 +81,53 @@ func go_wasm_exists(threadIndex C.uintptr_t, name *C.char) C.bool {
 }
 
 //export go_wasm_call
-func go_wasm_call(threadIndex C.uintptr_t, name *C.char, function *C.char, args *C.char) (*C.char, C.bool) {
+func go_wasm_call(threadIndex C.uintptr_t, name *C.char, function *C.char, args *C.char, argsLen C.int) (*C.char, C.int, C.bool) {
 	thread, ok := frankenphp.Thread(int(threadIndex))
 	if !ok || thread.IsRequestDone() {
-		return C.CString("Thread not available"), C.bool(false)
+		const msg = "Thread not available"
+		return C.CString(msg), C.int(len(msg)), C.bool(false)
 	}
 
 	ctx := thread.Request.Context()
 	plugins := wasm.FromContext(ctx)
 	if plugins == nil {
-		return C.CString("No plugin registry in context"), C.bool(false)
+		const msg = "No plugin registry in context"
+		return C.CString(msg), C.int(len(msg)), C.bool(false)
 	}
 
-	result, err := plugins.Call(ctx, C.GoString(name), C.GoString(function), C.GoString(args))
+	// Zero-copy: create a Go []byte view over the C memory.
+	// The C args string lives on the PHP stack and is valid for the duration
+	// of this CGO call, so this is safe — no copy needed.
+	var argsBytes []byte
+	if args != nil && argsLen > 0 {
+		argsBytes = unsafe.Slice((*byte)(unsafe.Pointer(args)), int(argsLen))
+	}
+
+	result, err := plugins.Call(ctx, C.GoString(name), C.GoString(function), argsBytes)
 
 	if err != nil {
-		return C.CString(err.Error()), C.bool(false)
+		errStr := err.Error()
+		return C.CString(errStr), C.int(len(errStr)), C.bool(false)
 	}
 
 	if result == nil {
-		return C.CString("failed to call plugin"), C.bool(false)
+		const msg = "failed to call plugin"
+		return C.CString(msg), C.int(len(msg)), C.bool(false)
 	}
 
-	return C.CString(string(result)), C.bool(true)
+	// Zero-copy return: allocate C memory and copy the result bytes directly
+	// into it, avoiding the Go string intermediate.
+	resultLen := len(result)
+	cResult := (*C.char)(C.malloc(C.size_t(resultLen + 1)))
+	if cResult == nil {
+		const msg = "out of memory"
+		return C.CString(msg), C.int(len(msg)), C.bool(false)
+	}
+
+	// Direct copy from Go []byte to C memory — no intermediate string
+	copy(unsafe.Slice((*byte)(unsafe.Pointer(cResult)), resultLen), result)
+	// Null-terminate for C string compatibility
+	*(*C.char)(unsafe.Pointer(uintptr(unsafe.Pointer(cResult)) + uintptr(resultLen))) = 0
+
+	return cResult, C.int(resultLen), C.bool(true)
 }
