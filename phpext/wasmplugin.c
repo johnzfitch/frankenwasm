@@ -236,7 +236,7 @@ PHP_METHOD(Wasm, call)
         ZSTR_VAL(intern->name),
         ZSTR_VAL(function_name),
         ZSTR_VAL(args_json.s),
-        (int)ZSTR_LEN(args_json.s)
+        (size_t)ZSTR_LEN(args_json.s)
     );
 
     smart_str_free(&args_json);

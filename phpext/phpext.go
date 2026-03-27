@@ -2,7 +2,7 @@ package phpext
 
 // #include <stdlib.h>
 // #include <stdint.h>
-// #cgo CFLAGS: -I../deps/frankenphp
+// #cgo CFLAGS: -I../frankenphp
 // #include "frankenphp.h"
 // #include "phpext.h"
 //
@@ -81,18 +81,24 @@ func go_wasm_exists(threadIndex C.uintptr_t, name *C.char) C.bool {
 }
 
 //export go_wasm_call
-func go_wasm_call(threadIndex C.uintptr_t, name *C.char, function *C.char, args *C.char, argsLen C.int) (*C.char, C.int, C.bool) {
+func go_wasm_call(threadIndex C.uintptr_t, name *C.char, function *C.char, args *C.char, argsLen C.size_t) (*C.char, C.size_t, C.bool) {
 	thread, ok := frankenphp.Thread(int(threadIndex))
 	if !ok || thread.IsRequestDone() {
 		const msg = "Thread not available"
-		return C.CString(msg), C.int(len(msg)), C.bool(false)
+		return C.CString(msg), C.size_t(len(msg)), C.bool(false)
 	}
 
 	ctx := thread.Request.Context()
 	plugins := wasm.FromContext(ctx)
 	if plugins == nil {
 		const msg = "No plugin registry in context"
-		return C.CString(msg), C.int(len(msg)), C.bool(false)
+		return C.CString(msg), C.size_t(len(msg)), C.bool(false)
+	}
+
+	// Bounds check: argsLen should not exceed max safe value
+	if argsLen > 1<<31-1 {
+		const msg = "args length exceeds maximum allowed size"
+		return C.CString(msg), C.size_t(len(msg)), C.bool(false)
 	}
 
 	// Zero-copy: create a Go []byte view over the C memory.
@@ -107,12 +113,12 @@ func go_wasm_call(threadIndex C.uintptr_t, name *C.char, function *C.char, args 
 
 	if err != nil {
 		errStr := err.Error()
-		return C.CString(errStr), C.int(len(errStr)), C.bool(false)
+		return C.CString(errStr), C.size_t(len(errStr)), C.bool(false)
 	}
 
 	if result == nil {
 		const msg = "failed to call plugin"
-		return C.CString(msg), C.int(len(msg)), C.bool(false)
+		return C.CString(msg), C.size_t(len(msg)), C.bool(false)
 	}
 
 	// Zero-copy return: allocate C memory and copy the result bytes directly
@@ -121,7 +127,7 @@ func go_wasm_call(threadIndex C.uintptr_t, name *C.char, function *C.char, args 
 	cResult := (*C.char)(C.malloc(C.size_t(resultLen + 1)))
 	if cResult == nil {
 		const msg = "out of memory"
-		return C.CString(msg), C.int(len(msg)), C.bool(false)
+		return C.CString(msg), C.size_t(len(msg)), C.bool(false)
 	}
 
 	// Direct copy from Go []byte to C memory — no intermediate string
@@ -129,5 +135,5 @@ func go_wasm_call(threadIndex C.uintptr_t, name *C.char, function *C.char, args 
 	// Null-terminate for C string compatibility
 	*(*C.char)(unsafe.Pointer(uintptr(unsafe.Pointer(cResult)) + uintptr(resultLen))) = 0
 
-	return cResult, C.int(resultLen), C.bool(true)
+	return cResult, C.size_t(resultLen), C.bool(true)
 }

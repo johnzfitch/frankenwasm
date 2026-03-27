@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 
 	extism "github.com/extism/go-sdk"
 )
@@ -11,6 +12,7 @@ import (
 var (
 	ErrPluginNotFound   = errors.New("plugin not found")
 	ErrFunctionNotFound = errors.New("function not found")
+	ErrPoolClosed       = errors.New("pool is closed")
 )
 
 type registryEntry struct {
@@ -18,12 +20,12 @@ type registryEntry struct {
 	plugin *extism.Plugin
 }
 
-// Registry maintains an ordered collection of plugin instances.
-// When used via Pool, each registry is request-private — no locks needed.
+// Registry maintains an ordered collection of request-scoped plugin instances.
 // Plugins can be eagerly or lazily instantiated.
 type Registry struct {
 	plugins   []registryEntry
 	pluginMap map[string]int // name -> index
+	locks     sync.Map
 	manager   *Manager
 
 	// Lazy instantiation support
@@ -40,11 +42,14 @@ func newRegistry() *Registry {
 }
 
 // Call invokes a plugin's function with the provided arguments.
-// No mutex — when used via Pool, the registry is request-private.
 // Uses the fast-path Extism call that skips error checking on success
 // and avoids the defensive output copy.
 func (r *Registry) Call(ctx context.Context, name, function string, args []byte) ([]byte, error) {
-	plugin, err := r.getOrInstantiate(ctx, name)
+	mutex := r.lockFor(name)
+	mutex.Lock()
+	defer mutex.Unlock()
+
+	plugin, err := r.getOrInstantiateLocked(ctx, name)
 	if err != nil {
 		return nil, err
 	}
@@ -62,8 +67,14 @@ func (r *Registry) Call(ctx context.Context, name, function string, args []byte)
 	return output, nil
 }
 
-// getOrInstantiate returns the plugin instance, instantiating lazily if needed.
-func (r *Registry) getOrInstantiate(ctx context.Context, name string) (*extism.Plugin, error) {
+func (r *Registry) lockFor(name string) *sync.Mutex {
+	lockVal, _ := r.locks.LoadOrStore(name, &sync.Mutex{})
+	return lockVal.(*sync.Mutex)
+}
+
+// getOrInstantiateLocked returns the plugin instance, instantiating lazily if needed.
+// The caller must hold the plugin-specific lock returned by lockFor(name).
+func (r *Registry) getOrInstantiateLocked(ctx context.Context, name string) (*extism.Plugin, error) {
 	// Fast path: already instantiated
 	if r.lazyInstances {
 		if inst, ok := r.instances[name]; ok {
@@ -99,17 +110,33 @@ func (r *Registry) getOrInstantiate(ctx context.Context, name string) (*extism.P
 }
 
 // Get returns a plugin with the given name from the registry.
+// For lazy registries, instantiates on demand using a background context.
 func (r *Registry) Get(name string) *extism.Plugin {
 	idx, ok := r.pluginMap[name]
 	if !ok {
 		return nil
 	}
-	// For lazy registries, check instances map first
+	// For lazy registries, instantiate on demand if not already instantiated
 	if r.lazyInstances {
 		if inst, ok := r.instances[name]; ok {
 			return inst
 		}
-		return nil
+		// Instantiate on demand with background context
+		ctx := context.Background()
+		mutex := r.lockFor(name)
+		mutex.Lock()
+		defer mutex.Unlock()
+
+		// Double-check after acquiring lock
+		if inst, ok := r.instances[name]; ok {
+			return inst
+		}
+
+		inst, err := r.getOrInstantiateLocked(ctx, name)
+		if err != nil {
+			return nil
+		}
+		return inst
 	}
 	return r.plugins[idx].plugin
 }
@@ -143,7 +170,7 @@ func (r *Registry) Len() int {
 }
 
 // Clone creates a new registry by re-instantiating all plugins through the manager.
-// Kept for backward compatibility — prefer Pool for production use.
+// Kept for backward compatibility; request handlers should usually use Manager.NewRegistry.
 func (r *Registry) Clone(ctx context.Context) (*Registry, error) {
 	if r.manager == nil {
 		return newRegistry(), nil
@@ -158,39 +185,37 @@ func (r *Registry) Clone(ctx context.Context) (*Registry, error) {
 }
 
 // InstantiateAll eagerly instantiates all plugins in this registry.
-// Used by Pool.WarmUp to pay instantiation cost upfront.
 func (r *Registry) InstantiateAll(ctx context.Context) error {
 	if !r.lazyInstances {
 		return nil
 	}
 
 	for _, p := range r.compiled {
-		if _, ok := r.instances[p.name]; ok {
-			continue
-		}
+		mutex := r.lockFor(p.name)
+		mutex.Lock()
 
-		inst, err := p.plugin.Instance(ctx, extism.PluginInstanceConfig{})
+		inst, err := r.getOrInstantiateLocked(ctx, p.name)
 		if err != nil {
-			return fmt.Errorf("failed to instantiate plugin '%s': %w", p.name, err)
+			mutex.Unlock()
+			return err
 		}
-		inst.SetLogger(r.manager.logAdapter(p.name))
-		r.instances[p.name] = inst
 
 		if idx, ok := r.pluginMap[p.name]; ok {
 			r.plugins[idx].plugin = inst
 		}
+
+		mutex.Unlock()
 	}
 
 	return nil
 }
 
-// Reset prepares the registry for reuse by the next request.
-// Plugin instances remain alive — only per-request state is cleared.
+// Reset clears per-request state in the registry.
+// Currently plugin instances are stateless between calls (Extism resets
+// internal state on each Call). This method exists as the extension point
+// for future per-request cleanup.
 func (r *Registry) Reset() {
-	// Currently plugin instances are stateless between calls (Extism resets
-	// internal state on each Call). No per-request state to clear beyond
-	// what Extism already handles. This method exists as the extension point
-	// for future per-request cleanup.
+	// No-op for now — reserved for future per-request cleanup
 }
 
 // Close releases all plugins and their associated resources.

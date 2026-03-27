@@ -27,6 +27,11 @@ type Pool struct {
 // NewPool creates a pool of pre-instantiated registries.
 // size should match the number of PHP threads for zero-contention dispatch.
 func NewPool(ctx context.Context, manager *Manager, size int) (*Pool, error) {
+	// Validate pool size
+	if size <= 0 {
+		return nil, fmt.Errorf("pool size must be positive, got %d", size)
+	}
+
 	manager.mu.RLock()
 	compiled := make([]pluginEntry, len(manager.plugins))
 	copy(compiled, manager.plugins)
@@ -63,7 +68,10 @@ func NewPool(ctx context.Context, manager *Manager, size int) (*Pool, error) {
 // The returned registry is exclusively owned by the caller until Put is called.
 func (p *Pool) Get(ctx context.Context) (*Registry, error) {
 	select {
-	case reg := <-p.slots:
+	case reg, ok := <-p.slots:
+		if !ok {
+			return nil, ErrPoolClosed
+		}
 		return reg, nil
 	case <-ctx.Done():
 		return nil, ctx.Err()
@@ -72,9 +80,15 @@ func (p *Pool) Get(ctx context.Context) (*Registry, error) {
 
 // Put returns a registry to the pool after resetting its state.
 // Plugins remain instantiated for reuse on the next request.
-func (p *Pool) Put(reg *Registry) {
+// Returns a sentinel error if the channel is closed.
+func (p *Pool) Put(reg *Registry) error {
 	reg.Reset()
-	p.slots <- reg
+	select {
+	case p.slots <- reg:
+		return nil
+	default:
+		return ErrPoolClosed
+	}
 }
 
 // Close drains the pool and closes all registries.
@@ -102,7 +116,14 @@ func (p *Pool) WarmUp(ctx context.Context) error {
 	timeout := time.After(30 * time.Second)
 	for i := 0; i < p.size; i++ {
 		select {
-		case reg := <-p.slots:
+		case reg, ok := <-p.slots:
+			if !ok {
+				// Put back what we have and bail
+				for _, r := range registries {
+					p.slots <- r
+				}
+				return ErrPoolClosed
+			}
 			registries = append(registries, reg)
 		case <-timeout:
 			// Put back what we have and bail
