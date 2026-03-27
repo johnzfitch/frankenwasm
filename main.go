@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"syscall"
@@ -46,10 +47,18 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Create plugin manager
+	// Resolve compilation cache path — persistent across restarts
+	cachePath := filepath.Join(os.TempDir(), "frankenwasm-cache")
+	if cp := os.Getenv("FRANKENWASM_CACHE_PATH"); cp != "" {
+		cachePath = cp
+	}
+
+	// Create plugin manager with parallel compilation workers
 	manager, err := wasm.NewManager(
 		wasm.WithLogger(logger.Handler()),
-		wasm.WithCachePath(filepath.Join(os.TempDir(), "frankenwasm-cache")),
+		wasm.WithCachePath(cachePath),
+		wasm.WithCompilationWorkers(runtime.NumCPU()),
+		wasm.WithSharedRuntime(),
 	)
 	if err != nil {
 		logger.Error("Failed to create plugin manager", "error", err)
@@ -57,7 +66,8 @@ func main() {
 	}
 	defer manager.Close(ctx)
 
-	// Load all discovered plugins
+	// Build name→path map and load all plugins in parallel
+	pluginPaths := make(map[string]string, len(wasmFiles))
 	for _, wasmFile := range wasmFiles {
 		name := strings.TrimSuffix(filepath.Base(wasmFile), ".wasm")
 		absPath, err := filepath.Abs(wasmFile)
@@ -65,24 +75,42 @@ func main() {
 			logger.Error("Failed to resolve plugin path", "file", wasmFile, "error", err)
 			continue
 		}
+		pluginPaths[name] = absPath
+	}
 
-		if err := manager.Load(ctx, name, absPath); err != nil {
-			logger.Error("Failed to load plugin", "name", name, "path", absPath, "error", err)
-			continue
-		}
+	if err := manager.LoadAll(ctx, pluginPaths); err != nil {
+		logger.Error("Failed to load plugins", "error", err)
+		os.Exit(1)
 	}
 
 	if !manager.IsLoaded() {
 		logger.Warn("No plugins loaded", "dir", pluginDir)
 	}
 
-	// Create a shared registry (will be cloned per request)
-	baseRegistry, err := manager.InstantiateAll(ctx)
+	// Resolve thread count — pool size matches PHP threads for zero-contention
+	numThreads := 2
+	if n, err := strconv.Atoi(os.Getenv("FRANKENWASM_THREADS")); err == nil && n > 0 {
+		numThreads = n
+	}
+
+	// Create thread-aligned pool with lazy instantiation
+	pool, err := wasm.NewPool(ctx, manager, numThreads)
 	if err != nil {
-		logger.Error("Failed to instantiate plugins", "error", err)
+		logger.Error("Failed to create plugin pool", "error", err)
 		os.Exit(1)
 	}
-	defer baseRegistry.Close(ctx)
+	defer pool.Close(ctx)
+
+	// Optional: warm up all pool slots (eagerly instantiate all plugins)
+	warmUp := os.Getenv("FRANKENWASM_WARMUP") != "0"
+	if warmUp {
+		start := time.Now()
+		if err := pool.WarmUp(ctx); err != nil {
+			logger.Warn("Pool warm-up had errors", "error", err)
+		} else {
+			logger.Info("Pool warmed up", "slots", numThreads, "duration", time.Since(start))
+		}
+	}
 
 	// Resolve document root
 	docRootDir := "examples"
@@ -96,11 +124,6 @@ func main() {
 	}
 
 	// Init FrankenPHP
-	numThreads := 2
-	if n, err := strconv.Atoi(os.Getenv("FRANKENWASM_THREADS")); err == nil && n > 0 {
-		numThreads = n
-	}
-
 	initOptions := []frankenphp.Option{
 		frankenphp.WithNumThreads(numThreads),
 		frankenphp.WithLogger(logger),
@@ -128,14 +151,14 @@ func main() {
 			r.URL.Path = r.URL.Path + "index.php"
 		}
 
-		// Clone registry for this request
-		registry, err := baseRegistry.Clone(r.Context())
+		// Get a registry from the pool (blocks if none available)
+		registry, err := pool.Get(r.Context())
 		if err != nil {
-			logger.Error("Failed to clone registry", "error", err)
+			logger.Error("Failed to get registry from pool", "error", err)
 			http.Error(w, "Internal server error", http.StatusInternalServerError)
 			return
 		}
-		defer registry.Close(r.Context())
+		defer pool.Put(registry)
 
 		// Add registry to context
 		ctx := wasm.WithContext(r.Context(), registry)
@@ -164,7 +187,14 @@ func main() {
 
 	// Start server in goroutine
 	go func() {
-		logger.Info("Starting FrankenWASM server", "addr", addr, "docroot", docRoot, "plugins", len(wasmFiles))
+		logger.Info("Starting FrankenWASM server",
+			"addr", addr,
+			"docroot", docRoot,
+			"plugins", len(wasmFiles),
+			"threads", numThreads,
+			"cache", cachePath,
+			"workers", runtime.NumCPU(),
+		)
 		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			logger.Error("Server error", "error", err)
 			os.Exit(1)

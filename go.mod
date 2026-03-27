@@ -71,4 +71,6 @@ require (
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
 
-replace github.com/dunglas/frankenphp v1.11.3 => ../frankenphp
+replace github.com/dunglas/frankenphp v1.11.3 => ./deps/frankenphp
+replace github.com/extism/go-sdk v1.7.1 => ./deps/extism-go-sdk
+replace github.com/tetratelabs/wazero v1.9.0 => ./deps/wazero

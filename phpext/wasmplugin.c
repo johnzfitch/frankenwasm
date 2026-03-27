@@ -229,16 +229,19 @@ PHP_METHOD(Wasm, call)
         smart_str_0(&args_json);
     }
 
+    /* Pass args length to avoid strlen on the Go side, and receive
+     * result length back to avoid strlen on the C side. */
     struct go_wasm_call_return result = go_wasm_call(
         frankenphp_thread_index(),
         ZSTR_VAL(intern->name),
         ZSTR_VAL(function_name),
-        ZSTR_VAL(args_json.s)
+        ZSTR_VAL(args_json.s),
+        (size_t)ZSTR_LEN(args_json.s)
     );
 
     smart_str_free(&args_json);
 
-    if (UNEXPECTED(!result.r1)) {
+    if (UNEXPECTED(!result.r2)) {
         if (result.r0) {
             frankenwasm_throw_exception("%s", result.r0);
             free(result.r0);
@@ -252,16 +255,19 @@ PHP_METHOD(Wasm, call)
         RETURN_NULL();
     }
 
+    /* Use the known length from Go instead of calling strlen() */
+    size_t result_len = (size_t)result.r1;
+
     zval decoded_result;
     ZVAL_UNDEF(&decoded_result);
 
     zend_try {
-        if (EXPECTED(php_json_decode_ex(&decoded_result, result.r0, strlen(result.r0),
+        if (EXPECTED(php_json_decode_ex(&decoded_result, result.r0, result_len,
                                          PHP_JSON_OBJECT_AS_ARRAY, FRANKENWASM_JSON_DEPTH) == SUCCESS)) {
             RETURN_ZVAL(&decoded_result, 1, 1);
             zval_ptr_dtor(&decoded_result);
         } else {
-            RETVAL_STRING(result.r0);
+            RETVAL_STRINGL(result.r0, result_len);
         }
 
         free(result.r0);
